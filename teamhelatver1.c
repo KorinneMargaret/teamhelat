@@ -1,12 +1,13 @@
 /*******************************************************************
  * Teensy 4.1: Robot Brain (TB6612FNG, Encoders, QTRX-HD-15A)
- * FEATURES: Acceleration Ramp, Arc-Coasting, Auto-Search, Encoder 90° Turns
+ * FEATURES: Acceleration Ramp, Aggressive Sharp Turn Overrides,
+ *           Broken/Dashed Line Recovery, Smooth Curve Handling
  *******************************************************************/
 
 #include <QTRSensors.h>
 #include <Encoder.h>
 
-// Forward declaration 
+// Forward declaration (needed for calibration sweep)
 void setMotors(int leftSpeed, int rightSpeed);
 
 // ==========================================
@@ -33,37 +34,43 @@ Encoder leftEnc(0, 1);
 Encoder rightEnc(2, 3);
 
 // ==========================================
-// 2. GLOBALS: PID & SPEED
+// 2. GLOBALS: PID
 // ==========================================
-// PID gains
-float Kp = 0.04, Ki = 0.000, Kd = 0.6;
+// PID gains — tuned for smooth curve following
+float Kp = 0.045, Ki = 0.0001, Kd = 0.55;
 int lastError = 0;
 long integralError = 0;
-const long INTEGRAL_CAP = 50000;
+const long INTEGRAL_CAP = 40000; // Anti-windup limit
+float filteredDerivative = 0.0;  // Smoothed derivative for curves
+const float DERIV_FILTER = 0.6;  // Low-pass filter coefficient (0-1, higher = more smoothing)
 
-int baseSpeed = 240;
-int currentBaseSpeed = 240;
+// Curve-rate tracking: detect when error is accelerating (curve tightening)
+int prevError = 0;        // error from 2 cycles ago
+float errorRate = 0.0;    // how fast the error is changing
+
+int baseSpeed = 200;
+int currentBaseSpeed = 200;
 int maxSpeedLimit = 240;
 
-const uint16_t BLACK_THRESHOLD = 700;  
-int lastDirection = 0;  
+const uint16_t BLACK_THRESHOLD = 700;  // Above this = sensor clearly sees black
+int lastDirection = 0;  // Remember which way we were turning (+/- error)
 
-// --- Advanced Line Handlers ---
-bool lineDetected = true;
+// --- Lost Line / Broken Line Recovery ---
+bool lineLost = false;
 unsigned long lineLostTime = 0;
-uint16_t lastValidPosition = 7000; 
-int lastGoodLeftSpeed = 0;
-int lastGoodRightSpeed = 0;
+const unsigned long MAX_GAP_TIME = 800;   // Max ms to bridge a dashed gap (increased for wider gaps)
+const int LOST_LINE_SPEED = 140;          // Forward speed while bridging a straight gap
 
-// --- ENCODER TARGET (TUNE THIS NUMBER) ---
-// This is the number of ticks required for one wheel to execute a 90-degree turn.
-// Start at 800 and adjust up or down based on physical testing.
-const long TICKS_FOR_90_DEG = 800; 
+// Save the ACTUAL motor outputs when line was last seen,
+// so we can replay the same curve through a gap
+int savedLeftSpeed  = 0;
+int savedRightSpeed = 0;
+int savedPosition   = 7000;  // Last known line position
 
 // --- Acceleration Timers ---
 unsigned long startTime = 0;
 unsigned long elapsedTime = 0;
-const unsigned long accelerationTime = 500; 
+const unsigned long accelerationTime = 500; // 500ms soft start
 
 // ==========================================
 // 3. SETUP & CALIBRATION
@@ -90,95 +97,32 @@ void setup() {
   qtr.setSensorPins(SENSOR_PINS, NUM_SENSORS);
   qtr.setEmitterPin(QTRNoEmitterPin);
 
+  // --- AUTO-CALIBRATE (with motor sweep for proper min/max learning) ---
   digitalWrite(13, HIGH);
   unsigned long calibStart = millis();
+  int sweepPhase = 0;
   while (millis() - calibStart < 5000) {
     qtr.calibrate();
+    // Sweep left-right so sensors see both black and white
     unsigned long elapsed = millis() - calibStart;
-    if (elapsed < 1000) setMotors(-80, 80);
-    else if (elapsed < 2500) setMotors(80, -80);
-    else if (elapsed < 4000) setMotors(-80, 80);
-    else setMotors(60, -60);
+    if (elapsed < 1000) {          // Turn left
+      setMotors(-80, 80);
+    } else if (elapsed < 2500) {   // Turn right
+      setMotors(80, -80);
+    } else if (elapsed < 4000) {   // Turn left again
+      setMotors(-80, 80);
+    } else {                       // Return to center
+      setMotors(60, -60);
+    }
   }
-  setMotors(0, 0); 
+  setMotors(0, 0);  // Stop after calibration
   digitalWrite(13, LOW);
 
   startTime = millis();
 }
 
 // ==========================================
-// 4. SMART ENCODER TURN FUNCTION
-// ==========================================
-// Executes a precise, closed-loop spin. Aborts early if the line is found
-// AFTER a minimum rotation to avoid false early detection.
-void executeEncoderTurn(int direction) {
-  // Reset encoders to 0
-  leftEnc.write(0);
-  rightEnc.write(0);
-  
-  // Use a slightly lower, controlled speed for accurate encoder counting
-  int turnSpeed = baseSpeed * 0.7; 
-  
-  // Don't check for line until we've turned at least 40% of the target.
-  // This prevents the safety catch from aborting immediately because the
-  // sensors are still sitting on/near the old line.
-  long minTicksBeforeCheck = TICKS_FOR_90_DEG * 0.4;
-  bool foundLine = false;
-  
-  while (abs(leftEnc.read()) < TICKS_FOR_90_DEG && abs(rightEnc.read()) < TICKS_FOR_90_DEG) {
-    if (direction < 0) { // Turn Left
-      setMotors(-turnSpeed, turnSpeed);
-    } else {             // Turn Right
-      setMotors(turnSpeed, -turnSpeed);
-    }
-    
-    // Only check sensors after minimum rotation
-    if (abs(leftEnc.read()) >= minTicksBeforeCheck) {
-      qtr.readLineBlack(sensorValues);
-      uint8_t currentBlack = 0;
-      for (uint8_t i = 0; i < NUM_SENSORS; i++) {
-        if (sensorValues[i] > BLACK_THRESHOLD) currentBlack++;
-      }
-      
-      // If we see the line after sufficient rotation, snap to it
-      if (currentBlack >= 2) {
-        foundLine = true;
-        break; 
-      }
-    }
-  }
-  
-  // Briefly stop motors to kill momentum after the pivot
-  setMotors(0, 0); 
-  delay(20); 
-  
-  // If line was NOT found during the turn, drive forward briefly
-  // to bridge the gap between the turn endpoint and the next line segment.
-  if (!foundLine) {
-    int forwardSpeed = baseSpeed * 0.5;
-    leftEnc.write(0);
-    rightEnc.write(0);
-    unsigned long driveStart = millis();
-    
-    // Drive forward for up to 350ms or until we find the line
-    while (millis() - driveStart < 350) {
-      setMotors(forwardSpeed, forwardSpeed);
-      qtr.readLineBlack(sensorValues);
-      uint8_t currentBlack = 0;
-      for (uint8_t i = 0; i < NUM_SENSORS; i++) {
-        if (sensorValues[i] > BLACK_THRESHOLD) currentBlack++;
-      }
-      if (currentBlack >= 2) {
-        break; // Found the line, hand off to PID
-      }
-    }
-    setMotors(0, 0);
-    delay(10);
-  }
-}
-
-// ==========================================
-// 5. MAIN LOOP
+// 4. MAIN LOOP
 // ==========================================
 void loop() {
 
@@ -207,165 +151,196 @@ void loop() {
     }
   }
 
-  // --- SAVE VALID POSITION ---
-  if (blackCount > 0) {
-    lastValidPosition = position;
-  }
-
-  // --- C. ADVANCED LOST LINE & GAP HANDLING ---
+  // ==========================================================
+  // --- C. BROKEN / DASHED LINE RECOVERY ---
+  // When NO sensors see the line, REPLAY the last motor speeds
+  // so we continue the same curve trajectory through the gap.
+  // ==========================================================
   if (blackCount == 0) {
-    if (lineDetected) {
-      lineLostTime = millis(); 
-      lineDetected = false;
-    }
-    
-    unsigned long lostDuration = millis() - lineLostTime;
-
-    // SCENARIO 1: SHARP CORNER OVERSHOOT (line fell off edges)
-    // Trigger for off-center positions indicating the line exited sideways.
-    // Threshold 3000/11000 catches tight curve exits + sharp corners.
-    if (lastValidPosition <= 3000 || lastValidPosition >= 11000) {
-      if (lastValidPosition <= 7000) {
-        executeEncoderTurn(-1); // Left spin
-      } else {
-        executeEncoderTurn(1);  // Right spin
-      }
-      
-      // CRITICAL: Reset position to center so a post-turn gap doesn't re-trigger
-      // another 90° spin. Instead, the robot will arc-coast forward through the gap.
-      lastValidPosition = 7000;
-      lastGoodLeftSpeed = currentBaseSpeed;
-      lastGoodRightSpeed = currentBaseSpeed;
-      
-      // Reset PID state so it doesn't jerk from old errors
-      lastError = 0;
-      integralError = 0;
-      
-      // Reset the lost timer so it doesn't instantly trigger a sweeping search after the turn
-      lineLostTime = millis(); 
-      lineDetected = false;
-      return; 
-    }
-
-    // SCENARIO 2: BROKEN LINE / DASHED LINE GAP
-    // Coast forward for up to 250ms. Short enough to not overshoot on this
-    // compact track, but enough to bridge dashed-line gaps at speed.
-    if (lostDuration < 250) { 
-      // ARC-COASTING (speeds are sanitized — guaranteed forward motion)
-      setMotors(lastGoodLeftSpeed, lastGoodRightSpeed);
-      return; 
-    } 
-    
-    // SCENARIO 3: COAST FAILED — likely a curve-to-sharp-turn transition
-    // The robot was following a curve, line vanished, coast didn't find it.
-    // Try an encoder turn toward the last known line direction.
-    if (lostDuration < 650) {
-      if (lastDirection < 0) {
-        executeEncoderTurn(-1);
-      } else {
-        executeEncoderTurn(1);
-      }
-      lastValidPosition = 7000;
-      lastGoodLeftSpeed = currentBaseSpeed;
-      lastGoodRightSpeed = currentBaseSpeed;
-      lastError = 0;
-      integralError = 0;
+    if (!lineLost) {
+      // Just lost the line — snapshot current state
+      lineLost = true;
       lineLostTime = millis();
-      lineDetected = false;
+      // savedLeftSpeed/savedRightSpeed are updated every cycle
+      // when line IS visible (see end of loop), so they hold
+      // the exact motor outputs from right before the gap.
+    }
+
+    unsigned long gapElapsed = millis() - lineLostTime;
+
+    if (gapElapsed < MAX_GAP_TIME) {
+      // === REPLAY the curve through the gap ===
+      // Use the saved motor speeds but scale down gradually
+      // so we don't overshoot if the gap is long.
+      float scaleFactor;
+      if (gapElapsed < 200) {
+        scaleFactor = 1.0;      // First 200ms: full replay
+      } else if (gapElapsed < 500) {
+        scaleFactor = 0.85;     // 200-500ms: slight reduction
+      } else {
+        scaleFactor = 0.70;     // 500-800ms: slower
+      }
+
+      // If we were on a curve, replay the differential.
+      // If we were going straight, just drive forward.
+      int gapLeft, gapRight;
+      int speedDiff = savedLeftSpeed - savedRightSpeed;
+
+      if (abs(speedDiff) > 20) {
+        // We were curving — replay the same left/right ratio
+        gapLeft  = (int)(savedLeftSpeed  * scaleFactor);
+        gapRight = (int)(savedRightSpeed * scaleFactor);
+        // Ensure minimum forward motion on both wheels
+        // (inner wheel can be 0 but not heavily negative)
+        gapLeft  = constrain(gapLeft,  -20, 220);
+        gapRight = constrain(gapRight, -20, 220);
+      } else {
+        // We were going mostly straight — drive forward
+        int gapSpeed = (int)(LOST_LINE_SPEED * scaleFactor);
+        gapLeft  = gapSpeed;
+        gapRight = gapSpeed;
+      }
+
+      setMotors(gapLeft, gapRight);
+      return;  // Skip normal PID this cycle
+    } else {
+      // Gap too long — search spin in the last known direction
+      if (lastDirection >= 0) {
+        setMotors(90, -90);   // Spin right
+      } else {
+        setMotors(-90, 90);   // Spin left
+      }
       return;
     }
-    
-    // SCENARIO 4: SWEEPING SEARCH (everything else failed)
-    int searchPhase = (lostDuration - 650) / 400; 
-    int spinSpeed = currentBaseSpeed * 0.7;
-
-    if (lastDirection < 0) { 
-      if (searchPhase % 2 == 0) setMotors(-spinSpeed, spinSpeed); 
-      else setMotors(spinSpeed, -spinSpeed);                      
-    } else {                 
-      if (searchPhase % 2 == 0) setMotors(spinSpeed, -spinSpeed); 
-      else setMotors(-spinSpeed, spinSpeed);                      
-    }
-    return; 
-    
   } else {
-    lineDetected = true; 
+    // Line found — reset lost-line state
+    if (lineLost) {
+      lineLost = false;
+      integralError = 0;  // Reset integral to avoid wind-up from gap
+    }
   }
 
   // --- WIDE-LINE / OFF-CENTER CORRECTION ---
   if (blackCount >= 13) {
+    // Nearly ALL sensors black — this is NOT a valid line reading.
+    // Keep turning in the last known direction to recover.
     error = (lastDirection >= 0) ? 6000 : -6000;
   } else if (blackCount >= 8) {
+    // Many sensors black but edges visible — use edge midpoint
     float edgeMid = (firstBlack + lastBlack) / 2.0;
-    float arrayCenterIdx = (NUM_SENSORS - 1) / 2.0; 
+    float arrayCenterIdx = (NUM_SENSORS - 1) / 2.0; // = 7.0
     error = (int)((edgeMid - arrayCenterIdx) * 1000);
   }
 
+  // Track which direction we're heading for recovery
   if (abs(error) > 500) {
     lastDirection = error;
   }
 
-  // --- PID CALCULATION ---
-  integralError += error;
-  integralError = constrain(integralError, -INTEGRAL_CAP, INTEGRAL_CAP);
-  int motorSpeed = (Kp * error) + (Ki * integralError) + (Kd * (error - lastError));
-  lastError = error;
+  // --- PID CALCULATION (with Integral + Filtered Derivative) ---
+    integralError += error;
+    integralError = constrain(integralError, -INTEGRAL_CAP, INTEGRAL_CAP);
 
-  // --- PROGRESSIVE SPEED ZONES ---
-  int activeBase = currentBaseSpeed;
-  int absError = abs(error);
-  if (absError > 3000) {        
-    activeBase = constrain(activeBase * 0.25, 40, activeBase);
-  } else if (absError > 2000) { 
-    activeBase = constrain(activeBase * 0.35, 45, activeBase);
-  } else if (absError > 1200) { 
-    activeBase = constrain(activeBase * 0.50, 50, activeBase);
-  } else if (absError > 600) {  
-    activeBase = constrain(activeBase * 0.65, 55, activeBase);
-  }
+    // Smooth the derivative term to reduce jitter on curves
+    float rawDerivative = (float)(error - lastError);
+    filteredDerivative = (DERIV_FILTER * filteredDerivative) + ((1.0 - DERIV_FILTER) * rawDerivative);
 
-  leftSpeed = activeBase + motorSpeed;
-  rightSpeed = activeBase - motorSpeed;
+    // Track curve rate: how fast is the error accelerating?
+    // Positive = curve is tightening, so we need to pre-steer harder
+    errorRate = 0.7 * errorRate + 0.3 * (float)(error - 2 * lastError + prevError);
+    prevError = lastError;
 
-  // --- AGGRESSIVE SHARP TURN OVERRIDES ---
-  if (position <= 3500) {         
-    leftSpeed = constrain(-activeBase * 1.8, -250, -120);
-    rightSpeed = constrain(activeBase * 1.8, 120, 250);
-    integralError = 0;
-  } else if (position >= 10500) { 
-    leftSpeed = constrain(activeBase * 1.8, 120, 250);
-    rightSpeed = constrain(-activeBase * 1.8, -250, -120);
-    integralError = 0;
-  }
+    int motorSpeed = (Kp * error) + (Ki * integralError) + (Kd * filteredDerivative);
+    lastError = error;
 
-  // --- SAVE TRAJECTORY FOR ARC-COASTING ---
-  // IMPORTANT: Only save speeds that move the robot forward.
-  // During sharp turn overrides, one wheel is negative (spinning in place).
-  // Arc-coasting with those values would spin the robot on dashed-line gaps.
-  // If the wheels are going opposite directions, save a gentle curve instead.
-  if ((leftSpeed >= 0) == (rightSpeed >= 0)) {
-    // Both wheels same direction = forward motion, safe to save
-    lastGoodLeftSpeed = leftSpeed;
-    lastGoodRightSpeed = rightSpeed;
-  } else {
-    // Wheels in opposite directions = spinning, save a gentle forward curve
-    // in the direction the robot was correcting toward
-    if (leftSpeed > rightSpeed) {
-      // Was turning right
-      lastGoodLeftSpeed = activeBase;
-      lastGoodRightSpeed = activeBase * 0.3;
-    } else {
-      // Was turning left
-      lastGoodLeftSpeed = activeBase * 0.3;
-      lastGoodRightSpeed = activeBase;
+    // --- PROGRESSIVE SPEED ZONES ---
+    // Slow down in curves, but NOT so much that the robot stalls.
+    // The key: keep enough forward speed to FOLLOW the curve, not pivot.
+    int activeBase = currentBaseSpeed;
+    int absError = abs(error);
+    float absRate = fabs(errorRate);
+
+    // If the curve is tightening rapidly, slow down more proactively
+    float rateFactor = 1.0;
+    if (absRate > 200) rateFactor = 0.85;
+    if (absRate > 500) rateFactor = 0.75;
+
+    if (absError > 5000) {        // Extreme — nearly off track
+      activeBase = constrain(activeBase * 0.35 * rateFactor, 50, activeBase);
+    } else if (absError > 3500) { // Very sharp curve
+      activeBase = constrain(activeBase * 0.45 * rateFactor, 55, activeBase);
+    } else if (absError > 2000) { // Sharp curve
+      activeBase = constrain(activeBase * 0.55 * rateFactor, 60, activeBase);
+    } else if (absError > 1200) { // Moderate curve
+      activeBase = constrain(activeBase * 0.70 * rateFactor, 65, activeBase);
+    } else if (absError > 600) {  // Gentle curve
+      activeBase = constrain(activeBase * 0.85, 70, activeBase);
     }
-  }
 
-  setMotors(leftSpeed, rightSpeed);
+    leftSpeed = activeBase + motorSpeed;
+    rightSpeed = activeBase - motorSpeed;
+
+    // ===========================================================
+    // --- DIFFERENTIAL STEERING (NOT pivoting!) ---
+    // On sharp curves: SLOW or STOP the inner wheel, keep outer
+    // wheel running. NEVER reverse the inner wheel unless the
+    // line is at the absolute extreme edge (last-resort recovery).
+    // This keeps the robot FOLLOWING the curve instead of spinning.
+    // ===========================================================
+
+    if (position <= 1000) {
+      // LAST RESORT: line at far extreme left edge — slight reverse inner
+      leftSpeed  = -40;
+      rightSpeed = constrain(activeBase * 1.2, 100, 200);
+      integralError = 0;
+    } else if (position >= 13000) {
+      // LAST RESORT: line at far extreme right edge — slight reverse inner
+      leftSpeed  = constrain(activeBase * 1.2, 100, 200);
+      rightSpeed = -40;
+      integralError = 0;
+    } else if (position <= 2500) {
+      // Sharp left: stop inner wheel, push outer
+      leftSpeed  = 0;
+      rightSpeed = constrain(activeBase * 1.3, 90, 220);
+      integralError = integralError / 2;
+    } else if (position >= 11500) {
+      // Sharp right: stop inner wheel, push outer
+      leftSpeed  = constrain(activeBase * 1.3, 90, 220);
+      rightSpeed = 0;
+      integralError = integralError / 2;
+    } else if (position <= 3500) {
+      // Moderate-sharp left: slow inner wheel significantly
+      leftSpeed  = constrain(activeBase * 0.15, 10, 40);
+      rightSpeed = constrain(activeBase * 1.1, 80, 210);
+    } else if (position >= 10500) {
+      // Moderate-sharp right: slow inner wheel significantly
+      leftSpeed  = constrain(activeBase * 1.1, 80, 210);
+      rightSpeed = constrain(activeBase * 0.15, 10, 40);
+    } else if (position <= 4500) {
+      // Moderate left: reduce inner, boost outer
+      leftSpeed  = constrain(leftSpeed, activeBase * 0.2, activeBase * 0.5);
+      rightSpeed = constrain(rightSpeed, activeBase * 0.8, activeBase * 1.1);
+    } else if (position >= 9500) {
+      // Moderate right: reduce inner, boost outer
+      leftSpeed  = constrain(leftSpeed, activeBase * 0.8, activeBase * 1.1);
+      rightSpeed = constrain(rightSpeed, activeBase * 0.2, activeBase * 0.5);
+    }
+    // else: position ~5000-9000 = normal PID handles it fine
+
+    // --- Final clamp: never exceed limits ---
+    leftSpeed  = constrain(leftSpeed,  -80, maxSpeedLimit);
+    rightSpeed = constrain(rightSpeed, -80, maxSpeedLimit);
+
+    // Save current motor outputs so gap-bridging can replay them
+    savedLeftSpeed  = leftSpeed;
+    savedRightSpeed = rightSpeed;
+    savedPosition   = position;
+
+    setMotors(leftSpeed, rightSpeed);
 }
 
 // ==========================================
-// 6. TB6612FNG MOTOR DRIVE
+// 5. TB6612FNG MOTOR DRIVE
 // ==========================================
 void setMotors(int leftSpeed, int rightSpeed) {
   leftSpeed = constrain(leftSpeed, -255, 255);
