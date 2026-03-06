@@ -194,20 +194,29 @@ void loop() {
         executeEncoderTurn(1);  // +1 triggers a perfect 90-degree right spin
       }
       
+      // CRITICAL: Reset position to center so a post-turn gap doesn't re-trigger
+      // another 90° spin. Instead, the robot will arc-coast forward through the gap.
+      lastValidPosition = 7000;
+      lastGoodLeftSpeed = currentBaseSpeed;
+      lastGoodRightSpeed = currentBaseSpeed;
+      
       // Reset the lost timer so it doesn't instantly trigger a sweeping search after the turn
       lineLostTime = millis(); 
+      lineDetected = false;
       return; 
     }
 
     // SCENARIO 2: BROKEN LINE (Line vanished from the center/middle)
-    if (lostDuration < 300) { 
+    // Use longer coast time (500ms) after a turn since the robot is driving
+    // straight and needs more time to reach the next line segment.
+    if (lostDuration < 500) { 
       // ARC-COASTING
       setMotors(lastGoodLeftSpeed, lastGoodRightSpeed);
       return; 
     } 
     
     // SCENARIO 3: TRULY LOST (Gap lasted too long)
-    int searchPhase = (lostDuration - 300) / 400; 
+    int searchPhase = (lostDuration - 500) / 400; 
     int spinSpeed = currentBaseSpeed * 0.7;
 
     if (lastDirection < 0) { 
