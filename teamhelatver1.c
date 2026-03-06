@@ -160,8 +160,8 @@ void executeEncoderTurn(int direction) {
     rightEnc.write(0);
     unsigned long driveStart = millis();
     
-    // Drive forward for up to 600ms or until we find the line
-    while (millis() - driveStart < 600) {
+    // Drive forward for up to 350ms or until we find the line
+    while (millis() - driveStart < 350) {
       setMotors(forwardSpeed, forwardSpeed);
       qtr.readLineBlack(sensorValues);
       uint8_t currentBlack = 0;
@@ -221,10 +221,10 @@ void loop() {
     
     unsigned long lostDuration = millis() - lineLostTime;
 
-    // SCENARIO 1: SHARP CORNER OVERSHOOT (line fell off extreme edges)
-    // Only trigger for clearly extreme positions. Do NOT trigger for moderate
-    // off-center (curves), as those should arc-coast through gaps instead.
-    if (lastValidPosition <= 2000 || lastValidPosition >= 12000) {
+    // SCENARIO 1: SHARP CORNER OVERSHOOT (line fell off edges)
+    // Trigger for off-center positions indicating the line exited sideways.
+    // Threshold 3000/11000 catches tight curve exits + sharp corners.
+    if (lastValidPosition <= 3000 || lastValidPosition >= 11000) {
       if (lastValidPosition <= 7000) {
         executeEncoderTurn(-1); // Left spin
       } else {
@@ -247,37 +247,36 @@ void loop() {
       return; 
     }
 
-    // SCENARIO 2: BROKEN LINE (Line vanished from the center/middle)
-    // Coast forward for up to 700ms to bridge gaps and broken line segments.
-    if (lostDuration < 700) { 
-      // ARC-COASTING
+    // SCENARIO 2: BROKEN LINE / DASHED LINE GAP
+    // Coast forward for up to 250ms. Short enough to not overshoot on this
+    // compact track, but enough to bridge dashed-line gaps at speed.
+    if (lostDuration < 250) { 
+      // ARC-COASTING (speeds are sanitized — guaranteed forward motion)
       setMotors(lastGoodLeftSpeed, lastGoodRightSpeed);
       return; 
     } 
     
-    // SCENARIO 3: TRULY LOST (arc-coast failed to find line)
-    // This catches curve-to-sharp-turn transitions: the robot was following a curve,
-    // line vanished, arc-coast drove forward but didn't find it = sharp turn ahead.
-    // Try ONE encoder turn in the last known direction before falling back to search.
-    if (lostDuration < 1100) {
-      // First attempt: execute a 90° turn toward the last known line direction
+    // SCENARIO 3: COAST FAILED — likely a curve-to-sharp-turn transition
+    // The robot was following a curve, line vanished, coast didn't find it.
+    // Try an encoder turn toward the last known line direction.
+    if (lostDuration < 650) {
       if (lastDirection < 0) {
         executeEncoderTurn(-1);
       } else {
         executeEncoderTurn(1);
       }
-      // Reset so we don't re-trigger the turn, fall through to search if it fails
       lastValidPosition = 7000;
       lastGoodLeftSpeed = currentBaseSpeed;
       lastGoodRightSpeed = currentBaseSpeed;
       lastError = 0;
       integralError = 0;
       lineLostTime = millis();
+      lineDetected = false;
       return;
     }
     
     // SCENARIO 4: SWEEPING SEARCH (everything else failed)
-    int searchPhase = (lostDuration - 1100) / 400; 
+    int searchPhase = (lostDuration - 650) / 400; 
     int spinSpeed = currentBaseSpeed * 0.7;
 
     if (lastDirection < 0) { 
@@ -340,8 +339,27 @@ void loop() {
   }
 
   // --- SAVE TRAJECTORY FOR ARC-COASTING ---
-  lastGoodLeftSpeed = leftSpeed;
-  lastGoodRightSpeed = rightSpeed;
+  // IMPORTANT: Only save speeds that move the robot forward.
+  // During sharp turn overrides, one wheel is negative (spinning in place).
+  // Arc-coasting with those values would spin the robot on dashed-line gaps.
+  // If the wheels are going opposite directions, save a gentle curve instead.
+  if ((leftSpeed >= 0) == (rightSpeed >= 0)) {
+    // Both wheels same direction = forward motion, safe to save
+    lastGoodLeftSpeed = leftSpeed;
+    lastGoodRightSpeed = rightSpeed;
+  } else {
+    // Wheels in opposite directions = spinning, save a gentle forward curve
+    // in the direction the robot was correcting toward
+    if (leftSpeed > rightSpeed) {
+      // Was turning right
+      lastGoodLeftSpeed = activeBase;
+      lastGoodRightSpeed = activeBase * 0.3;
+    } else {
+      // Was turning left
+      lastGoodLeftSpeed = activeBase * 0.3;
+      lastGoodRightSpeed = activeBase;
+    }
+  }
 
   setMotors(leftSpeed, rightSpeed);
 }
