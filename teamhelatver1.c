@@ -160,8 +160,8 @@ void executeEncoderTurn(int direction) {
     rightEnc.write(0);
     unsigned long driveStart = millis();
     
-    // Drive forward for up to 400ms or until we find the line
-    while (millis() - driveStart < 400) {
+    // Drive forward for up to 600ms or until we find the line
+    while (millis() - driveStart < 600) {
       setMotors(forwardSpeed, forwardSpeed);
       qtr.readLineBlack(sensorValues);
       uint8_t currentBlack = 0;
@@ -221,12 +221,18 @@ void loop() {
     
     unsigned long lostDuration = millis() - lineLostTime;
 
-    // SCENARIO 1: SHARP CORNER OVERSHOOT (Line fell off extreme edges)
-    if (lastValidPosition <= 2000 || lastValidPosition >= 12000) {
-      if (lastValidPosition <= 2000) {
-        executeEncoderTurn(-1); // -1 triggers a perfect 90-degree left spin
+    // SCENARIO 1: SHARP CORNER OVERSHOOT
+    // Immediate trigger for extreme positions (clear overshoot).
+    // Delayed trigger for moderate off-center (catches curve-to-sharp-turn transitions).
+    // Without the delay, brief gaps during normal curve following would falsely trigger a 90° spin.
+    bool extremeEdge = (lastValidPosition <= 2000 || lastValidPosition >= 12000);
+    bool moderateEdge = (lastValidPosition <= 4500 || lastValidPosition >= 9500);
+    
+    if (extremeEdge || (moderateEdge && lostDuration > 120)) {
+      if (lastValidPosition <= 7000) {
+        executeEncoderTurn(-1); // Left spin
       } else {
-        executeEncoderTurn(1);  // +1 triggers a perfect 90-degree right spin
+        executeEncoderTurn(1);  // Right spin
       }
       
       // CRITICAL: Reset position to center so a post-turn gap doesn't re-trigger
@@ -246,16 +252,15 @@ void loop() {
     }
 
     // SCENARIO 2: BROKEN LINE (Line vanished from the center/middle)
-    // Use longer coast time (500ms) after a turn since the robot is driving
-    // straight and needs more time to reach the next line segment.
-    if (lostDuration < 500) { 
+    // Coast forward for up to 700ms to bridge gaps and broken line segments.
+    if (lostDuration < 700) { 
       // ARC-COASTING
       setMotors(lastGoodLeftSpeed, lastGoodRightSpeed);
       return; 
     } 
     
     // SCENARIO 3: TRULY LOST (Gap lasted too long)
-    int searchPhase = (lostDuration - 500) / 400; 
+    int searchPhase = (lostDuration - 700) / 400; 
     int spinSpeed = currentBaseSpeed * 0.7;
 
     if (lastDirection < 0) { 
