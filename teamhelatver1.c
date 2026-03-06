@@ -221,14 +221,10 @@ void loop() {
     
     unsigned long lostDuration = millis() - lineLostTime;
 
-    // SCENARIO 1: SHARP CORNER OVERSHOOT
-    // Immediate trigger for extreme positions (clear overshoot).
-    // Delayed trigger for moderate off-center (catches curve-to-sharp-turn transitions).
-    // Without the delay, brief gaps during normal curve following would falsely trigger a 90° spin.
-    bool extremeEdge = (lastValidPosition <= 2000 || lastValidPosition >= 12000);
-    bool moderateEdge = (lastValidPosition <= 4500 || lastValidPosition >= 9500);
-    
-    if (extremeEdge || (moderateEdge && lostDuration > 120)) {
+    // SCENARIO 1: SHARP CORNER OVERSHOOT (line fell off extreme edges)
+    // Only trigger for clearly extreme positions. Do NOT trigger for moderate
+    // off-center (curves), as those should arc-coast through gaps instead.
+    if (lastValidPosition <= 2000 || lastValidPosition >= 12000) {
       if (lastValidPosition <= 7000) {
         executeEncoderTurn(-1); // Left spin
       } else {
@@ -259,8 +255,29 @@ void loop() {
       return; 
     } 
     
-    // SCENARIO 3: TRULY LOST (Gap lasted too long)
-    int searchPhase = (lostDuration - 700) / 400; 
+    // SCENARIO 3: TRULY LOST (arc-coast failed to find line)
+    // This catches curve-to-sharp-turn transitions: the robot was following a curve,
+    // line vanished, arc-coast drove forward but didn't find it = sharp turn ahead.
+    // Try ONE encoder turn in the last known direction before falling back to search.
+    if (lostDuration < 1100) {
+      // First attempt: execute a 90° turn toward the last known line direction
+      if (lastDirection < 0) {
+        executeEncoderTurn(-1);
+      } else {
+        executeEncoderTurn(1);
+      }
+      // Reset so we don't re-trigger the turn, fall through to search if it fails
+      lastValidPosition = 7000;
+      lastGoodLeftSpeed = currentBaseSpeed;
+      lastGoodRightSpeed = currentBaseSpeed;
+      lastError = 0;
+      integralError = 0;
+      lineLostTime = millis();
+      return;
+    }
+    
+    // SCENARIO 4: SWEEPING SEARCH (everything else failed)
+    int searchPhase = (lostDuration - 1100) / 400; 
     int spinSpeed = currentBaseSpeed * 0.7;
 
     if (lastDirection < 0) { 
