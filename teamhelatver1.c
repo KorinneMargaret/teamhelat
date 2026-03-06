@@ -109,7 +109,8 @@ void setup() {
 // ==========================================
 // 4. SMART ENCODER TURN FUNCTION
 // ==========================================
-// Executes a precise, closed-loop spin. Aborts early if the line is found.
+// Executes a precise, closed-loop spin. Aborts early if the line is found
+// AFTER a minimum rotation to avoid false early detection.
 void executeEncoderTurn(int direction) {
   // Reset encoders to 0
   leftEnc.write(0);
@@ -118,6 +119,12 @@ void executeEncoderTurn(int direction) {
   // Use a slightly lower, controlled speed for accurate encoder counting
   int turnSpeed = baseSpeed * 0.7; 
   
+  // Don't check for line until we've turned at least 40% of the target.
+  // This prevents the safety catch from aborting immediately because the
+  // sensors are still sitting on/near the old line.
+  long minTicksBeforeCheck = TICKS_FOR_90_DEG * 0.4;
+  bool foundLine = false;
+  
   while (abs(leftEnc.read()) < TICKS_FOR_90_DEG && abs(rightEnc.read()) < TICKS_FOR_90_DEG) {
     if (direction < 0) { // Turn Left
       setMotors(-turnSpeed, turnSpeed);
@@ -125,21 +132,49 @@ void executeEncoderTurn(int direction) {
       setMotors(turnSpeed, -turnSpeed);
     }
     
-    // SAFETY CATCH: Check sensors during the turn!
-    qtr.readLineBlack(sensorValues);
-    uint8_t currentBlack = 0;
-    for (uint8_t i = 0; i < NUM_SENSORS; i++) {
-      if (sensorValues[i] > BLACK_THRESHOLD) currentBlack++;
-    }
-    
-    // If we see the line midway through the turn, abort the spin and return to PID tracking
-    if (currentBlack > 0) {
-      break; 
+    // Only check sensors after minimum rotation
+    if (abs(leftEnc.read()) >= minTicksBeforeCheck) {
+      qtr.readLineBlack(sensorValues);
+      uint8_t currentBlack = 0;
+      for (uint8_t i = 0; i < NUM_SENSORS; i++) {
+        if (sensorValues[i] > BLACK_THRESHOLD) currentBlack++;
+      }
+      
+      // If we see the line after sufficient rotation, snap to it
+      if (currentBlack >= 2) {
+        foundLine = true;
+        break; 
+      }
     }
   }
+  
   // Briefly stop motors to kill momentum after the pivot
   setMotors(0, 0); 
   delay(20); 
+  
+  // If line was NOT found during the turn, drive forward briefly
+  // to bridge the gap between the turn endpoint and the next line segment.
+  if (!foundLine) {
+    int forwardSpeed = baseSpeed * 0.5;
+    leftEnc.write(0);
+    rightEnc.write(0);
+    unsigned long driveStart = millis();
+    
+    // Drive forward for up to 400ms or until we find the line
+    while (millis() - driveStart < 400) {
+      setMotors(forwardSpeed, forwardSpeed);
+      qtr.readLineBlack(sensorValues);
+      uint8_t currentBlack = 0;
+      for (uint8_t i = 0; i < NUM_SENSORS; i++) {
+        if (sensorValues[i] > BLACK_THRESHOLD) currentBlack++;
+      }
+      if (currentBlack >= 2) {
+        break; // Found the line, hand off to PID
+      }
+    }
+    setMotors(0, 0);
+    delay(10);
+  }
 }
 
 // ==========================================
@@ -199,6 +234,10 @@ void loop() {
       lastValidPosition = 7000;
       lastGoodLeftSpeed = currentBaseSpeed;
       lastGoodRightSpeed = currentBaseSpeed;
+      
+      // Reset PID state so it doesn't jerk from old errors
+      lastError = 0;
+      integralError = 0;
       
       // Reset the lost timer so it doesn't instantly trigger a sweeping search after the turn
       lineLostTime = millis(); 
